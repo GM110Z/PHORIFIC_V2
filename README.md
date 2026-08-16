@@ -100,7 +100,7 @@ Missing stages are run normally.
 To guarantee that no external analysis program is launched, use:
 
 ```bash
-python3 hotspot_pipeline.py \
+python3 PHORIFIC_V2.py \
   --input-dir collected_gff3 \
   --outdir hotspot_results \
   --window-kb 20 \
