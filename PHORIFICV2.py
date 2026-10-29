@@ -1,4 +1,10 @@
 #!/usr/bin/env python3
+"""PhorificV2: find recurrent defence hotspots from paired genome annotations.
+
+The pipeline deliberately uses only the Python standard library. PADLOC and
+MMseqs2 are invoked as external programs, and all intermediate tables remain
+available for auditing and threshold tuning.
+"""
 
 from __future__ import annotations
 
@@ -286,6 +292,38 @@ def normal_name(name: str) -> str:
     return re.sub(r"[^a-z0-9]", "", name.lower())
 
 
+def gene_id_aliases(gene_id: str) -> set[str]:
+    """Return the common GFF/FASTA spellings of one protein identifier."""
+    value = gene_id.strip()
+    bare = re.sub(r"^cds-", "", value)
+    return {value, bare, f"cds-{bare}"}
+
+
+def genes_called_by_system(genes: list[Gene], system: SystemCall) -> list[Gene]:
+    """Map a caller's component proteins back to genes, with a span fallback."""
+    called = set().union(*(gene_id_aliases(x) for x in system.proteins)) if system.proteins else set()
+    matched = [g for g in genes if gene_id_aliases(g.gene_id) & called]
+    if matched:
+        return matched
+    # Retain visibility for unusual caller IDs that cannot be mapped directly.
+    return [g for g in genes if g.end >= system.start and g.start <= system.end]
+
+
+def combined_system_call(genome: str, contig: str, source_id: str,
+                         systems: list[SystemCall], left: Gene, right: Gene) -> SystemCall:
+    """Create the display-level call for all systems inside one boundary pair."""
+    if not systems:
+        return SystemCall(genome, "boundary_scan", source_id, contig,
+                          left.end + 1, right.start - 1, "no defence detected", set(), {"boundary_scan"})
+    return SystemCall(
+        genome, "boundary_scan", source_id, contig,
+        min(s.start for s in systems), max(s.end for s in systems),
+        "; ".join(sorted({s.system for s in systems})),
+        set().union(*(s.proteins for s in systems)),
+        set().union(*(s.routes for s in systems)) | {"boundary_scan"},
+    )
+
+
 def overlap_fraction(a: SystemCall, b: SystemCall) -> float:
     overlap = max(0, min(a.end, b.end) - max(a.start, b.start) + 1)
     return overlap / max(1, min(a.end - a.start + 1, b.end - b.start + 1))
@@ -345,7 +383,51 @@ def tsv(path: Path, header: list[str], rows) -> None:
         writer.writerows(rows)
 
 
-def write_genes_gff(path: Path, genes: list[Gene], source: str = "hotspot_pipeline",
+def load_precomputed_systems(path: Path, allowed_genomes: set[str]) -> list[SystemCall]:
+    """Load already-dereplicated PADLOC/DefenseFinder calls.
+
+    This is used by downstream MGE analyses, where rerunning the callers on an
+    excised element would both waste work and lose the original genomic
+    coordinate context.
+    """
+    if not path.is_file():
+        fail(f"precomputed systems table not found: {path}")
+    with path.open(newline="") as handle:
+        rows = list(csv.DictReader(handle, delimiter="\t"))
+    required = {"genome", "contig", "start", "end", "system"}
+    if rows and not required.issubset(rows[0]):
+        fail(f"precomputed systems table lacks columns: {', '.join(sorted(required - set(rows[0])))}")
+    systems = []
+    for row in rows:
+        if row["genome"] not in allowed_genomes:
+            continue
+        callers = {x for x in row.get("callers", "precomputed").split(",") if x}
+        source = row.get("source_ids") or row.get("source_id") or row.get("locus_id") or "precomputed"
+        systems.append(SystemCall(
+            genome=row["genome"], route="precomputed", source_id=source,
+            contig=row["contig"], start=int(row["start"]), end=int(row["end"]),
+            system=row["system"], routes=callers or {"precomputed"},
+        ))
+    return systems
+
+
+def load_excluded_boundary_pairs(path: Path | None) -> set[tuple[str, str]]:
+    if path is None:
+        return set()
+    if not path.is_file():
+        fail(f"excluded boundary-pair table not found: {path}")
+    pairs = set()
+    with path.open(newline="") as handle:
+        reader = csv.DictReader(handle, delimiter="\t")
+        required = {"left_boundary_cluster", "right_boundary_cluster"}
+        if reader.fieldnames is None or not required.issubset(reader.fieldnames):
+            fail("excluded boundary-pair table must contain left_boundary_cluster and right_boundary_cluster")
+        for row in reader:
+            pairs.add((row["left_boundary_cluster"], row["right_boundary_cluster"]))
+    return pairs
+
+
+def write_genes_gff(path: Path, genes: list[Gene], source: str = "PhorificV2",
                     seqid_prefix: str = "") -> None:
     with path.open("w") as handle:
         handle.write("##gff-version 3\n")
@@ -415,14 +497,28 @@ def write_vector_pdf(path: Path, width: int, height: int, commands: list[str]) -
     path.write_bytes(output)
 
 
-def pdf_hotspot_group(path: Path, hotspot: str, instances, locus_genes, system_for_locus) -> None:
+def pdf_hotspot_group(path: Path, hotspot: str, instances, locus_genes,
+                      system_for_locus, systems_for_locus, palette: str = "classic",
+                      edge_anchor_side: str | None = None) -> None:
     """Draw every instance of one boundary-pair architecture in one vector PDF."""
-    width, left_margin, right_margin, row_height = 1700, 440, 60, 78
+    width, left_margin, right_margin = 1700, 440, 60
     spans = [right.end - left.start + 1 for _, left, right, _ in instances]
     max_span = max(spans)
     scale = (width - left_margin - right_margin) / max_span
-    height = 75 + row_height * len(instances) + 55
+    row_heights = [78 + 14 * max(0, len(systems_for_locus.get(lid, [])) - 1)
+                   for lid, _, _, _ in instances]
+    height = 75 + sum(row_heights) + 55
     commands = ["0.8 w"]
+    if palette == "peach":
+        boundary_colour = (0.95, 0.63, 0.40)
+        defence_colour = (0.31, 0.39, 0.57)
+        other_colour = (0.76, 0.80, 0.85)
+        bracket_colour = (0.22, 0.28, 0.43)
+    else:
+        boundary_colour = (0.27, 0.46, 0.71)
+        defence_colour = (0.84, 0.19, 0.15)
+        other_colour = (0.74, 0.74, 0.74)
+        bracket_colour = (0.65, 0, 0.15)
 
     def py(y_from_top: float) -> float:
         return height - y_from_top
@@ -442,50 +538,78 @@ def pdf_hotspot_group(path: Path, hotspot: str, instances, locus_genes, system_f
         path_cmd += [f"{x:.1f} {py(y):.1f} l" for x, y in points[1:]]
         commands.append(" ".join(path_cmd) + " h B")
 
-    text(30, 28, f"{hotspot} - {len(instances)} instances aligned at left boundary", 17)
+    if edge_anchor_side == "left":
+        title = f"{hotspot} - {len(instances)} instances aligned at conserved right boundary; open left edge"
+    elif edge_anchor_side == "right":
+        title = f"{hotspot} - {len(instances)} instances aligned at conserved left boundary; open right edge"
+    else:
+        title = f"{hotspot} - {len(instances)} instances aligned at left boundary"
+    text(30, 28, title, 17)
+    row_top = 75
     for row_index, (lid, left, right, _) in enumerate(instances):
         system = system_for_locus[lid]
-        y = 75 + row_index * row_height
+        locus_systems = systems_for_locus.get(lid, [])
+        y = row_top + 14 * max(0, len(locus_systems) - 1)
+        row_top += row_heights[row_index]
         between = [g for g in locus_genes[lid] if g.start >= left.start and g.end <= right.end]
-        label = f"{lid} | {system.genome} | {system.contig}:{left.start}-{right.end} | {system.system}"
-        text(20, y + 3, label, 9)
-        line(left_margin, y, left_margin + (right.end-left.start+1)*scale, y, (0.33, 0.33, 0.33))
+        if system.genome == system.contig and "__" in system.genome:
+            parts = system.genome.split("__", 2)
+            display_location = f"{parts[1]} | {parts[2]}:{left.start}-{right.end}" if len(parts) == 3 else system.genome
+        else:
+            display_location = f"{system.genome} | {system.contig}:{left.start}-{right.end}"
+        # Keep the row identifier concise and clear of the gene arrows. Defence
+        # systems are already labelled once above their corresponding blocks.
+        text(20, y + 3, display_location, 9)
+        locus_span = right.end - left.start + 1
+        row_x0 = (left_margin + (max_span - locus_span) * scale
+                  if edge_anchor_side == "left" else left_margin)
+        line(row_x0, y, row_x0 + locus_span*scale, y, (0.33, 0.33, 0.33))
         for gene in between:
-            x1 = left_margin + (gene.start - left.start) * scale
-            x2 = left_margin + (gene.end - left.start + 1) * scale
+            x1 = row_x0 + (gene.start - left.start) * scale
+            x2 = row_x0 + (gene.end - left.start + 1) * scale
             tip = min(9, max(2, (x2 - x1) / 3))
             if gene.strand == "-":
                 points = [(x2, y-11), (x1+tip, y-11), (x1, y), (x1+tip, y+11), (x2, y+11)]
             else:
                 points = [(x1, y-11), (x2-tip, y-11), (x2, y), (x2-tip, y+11), (x1, y+11)]
-            colour = (0.84, 0.19, 0.15) if gene.defence else ((0.27, 0.46, 0.71) if gene in (left, right) else (0.74, 0.74, 0.74))
+            # Boundary identity is the primary visual encoding: keep both ends
+            # orange even when a boundary gene is itself part of a defence call.
+            # The system bracket above the gene still records its defence role.
+            is_edge_anchor = ((edge_anchor_side == "left" and gene is left)
+                              or (edge_anchor_side == "right" and gene is right))
+            is_boundary = gene in (left, right) and not is_edge_anchor
+            colour = (boundary_colour if is_boundary
+                      else defence_colour if gene.defence else other_colour)
             polygon(points, colour)
             if gene in (left, right):
                 text((x1+x2)/2, y+27, gene.gene_id, 8, centred=True)
-        defence_genes = [g for g in between if g.defence]
-        if defence_genes:
-            block_x1 = left_margin + (min(g.start for g in defence_genes) - left.start) * scale
-            block_x2 = left_margin + (max(g.end for g in defence_genes) - left.start + 1) * scale
-            bracket_y = y - 20
-            line(block_x1, bracket_y, block_x2, bracket_y, (0.65, 0, 0.15), 1.2)
-            line(block_x1, bracket_y, block_x1, bracket_y+5, (0.65, 0, 0.15), 1.2)
-            line(block_x2, bracket_y, block_x2, bracket_y+5, (0.65, 0, 0.15), 1.2)
-            text((block_x1+block_x2)/2, bracket_y-5, system.system, 10, (0.65, 0, 0.15), centred=True)
-        else:
-            text(left_margin + (right.end-left.start+1)*scale/2, y-20,
-                 "no defence detected", 10, (0.35, 0.35, 0.35), centred=True)
+        if locus_systems:
+            for system_index, internal_system in enumerate(locus_systems):
+                defence_genes = genes_called_by_system(between, internal_system)
+                if not defence_genes:
+                    continue
+                block_x1 = row_x0 + (min(g.start for g in defence_genes) - left.start) * scale
+                block_x2 = row_x0 + (max(g.end for g in defence_genes) - left.start + 1) * scale
+                bracket_y = y - 20 - 14 * system_index
+                line(block_x1, bracket_y, block_x2, bracket_y, bracket_colour, 1.2)
+                line(block_x1, bracket_y, block_x1, bracket_y+5, bracket_colour, 1.2)
+                line(block_x2, bracket_y, block_x2, bracket_y+5, bracket_colour, 1.2)
+                text((block_x1+block_x2)/2, bracket_y-5, internal_system.system,
+                     10, bracket_colour, centred=True)
     legend_y = height - 25
-    polygon([(30, legend_y-10), (44, legend_y-10), (44, legend_y), (30, legend_y)], (0.27, 0.46, 0.71))
+    polygon([(30, legend_y-10), (44, legend_y-10), (44, legend_y), (30, legend_y)], boundary_colour)
     text(50, legend_y, "boundary", 10)
-    polygon([(125, legend_y-10), (139, legend_y-10), (139, legend_y), (125, legend_y)], (0.84, 0.19, 0.15))
+    polygon([(125, legend_y-10), (139, legend_y-10), (139, legend_y), (125, legend_y)], defence_colour)
     text(145, legend_y, "defence", 10)
-    polygon([(215, legend_y-10), (229, legend_y-10), (229, legend_y), (215, legend_y)], (0.74, 0.74, 0.74))
+    polygon([(215, legend_y-10), (229, legend_y-10), (229, legend_y), (215, legend_y)], other_colour)
     text(235, legend_y, "other/hypothetical gene", 10)
     write_vector_pdf(path, width, height, commands)
 
 
 def main() -> None:
-    p = argparse.ArgumentParser(description="PADLOC + DefenseFinder comparative hotspot pipeline")
+    p = argparse.ArgumentParser(
+        description="PhorificV2: PADLOC + DefenseFinder comparative defence-hotspot finder"
+    )
     inputs = p.add_mutually_exclusive_group(required=True)
     inputs.add_argument("--input-dir", type=Path,
                         help="folder recursively containing same-stem .gff/.gff3 and .faa files; .fna is optional")
@@ -496,13 +620,15 @@ def main() -> None:
     p.add_argument("--min-seq-id", type=float, default=0.5)
     p.add_argument("--coverage", type=float, default=0.8)
     p.add_argument("--min-call-overlap", type=float, default=0.5)
+    p.add_argument("--exclude-system", action="append", default=["VSPR"],
+                   help="caller system name to exclude before hotspot inference; repeatable (default: VSPR)")
     p.add_argument("--min-boundary-frequency", type=float, default=0.5)
     p.add_argument("--min-comparable-loci", type=int, default=3,
                    help="minimum loci in a defence-system group before boundary inference")
     p.add_argument("--min-hotspot-members", type=int, default=2,
                    help="minimum instances required to emit a hotspot locus representation")
     p.add_argument("--boundary-scan-span-factor", type=float, default=2.0,
-                   help="maximum boundary-only span as a multiple of the longest detected instance")
+                   help="maximum boundary-match span as a multiple of the longest detected instance")
     p.add_argument("--min-side-balance", type=float, default=0.5,
                    help="min(left frequency,right frequency)/max(...)")
     p.add_argument("--max-boundary-distance-kb", type=float, default=None)
@@ -520,11 +646,23 @@ def main() -> None:
     p.add_argument("--skip-mmseqs", action="store_true", help="reuse outdir/mmseqs/all_proteins_cluster.tsv")
     p.add_argument("--representation-only", action="store_true",
                    help="never run external tools; require cached PADLOC, DefenseFinder and MMseqs results")
+    p.add_argument("--precomputed-systems", type=Path,
+                   help="already-dereplicated system calls; bypass PADLOC and DefenseFinder")
+    p.add_argument("--precomputed-clusters", type=Path,
+                   help="MMseqs-style representative/member table; bypass protein clustering")
+    p.add_argument("--exclude-boundary-pairs", type=Path,
+                   help="TSV of existing boundary-cluster pairs that must not become hotspots")
+    p.add_argument("--hotspot-prefix", default="hotspot",
+                   help="output hotspot ID prefix (default: hotspot)")
+    p.add_argument("--plot-palette", choices=("classic", "peach"), default="classic",
+                   help="comparative-locus colour palette (default: classic)")
     p.add_argument("--dry-run", action="store_true")
     args = p.parse_args()
     if (args.window_kb <= 0 or not (0 <= args.min_side_balance <= 1)
             or args.min_hotspot_members < 1 or args.boundary_scan_span_factor < 1):
         fail("window and threshold arguments are out of range")
+    if not re.fullmatch(r"[A-Za-z0-9_.-]+", args.hotspot_prefix):
+        fail("--hotspot-prefix may contain only letters, numbers, dot, underscore and hyphen")
     rows = discover_genomes(args.input_dir) if args.input_dir else load_manifest(args.manifest)
     out = args.outdir.resolve()
     for sub in ("padloc", "defensefinder", "neighbourhoods", "mmseqs", "loci", "logs"):
@@ -542,63 +680,75 @@ def main() -> None:
         genes, lengths = read_gff(Path(row["gff"]), genome, proteins)
         genes_by_genome[genome], lengths_by_genome[genome] = genes, lengths
         contigs_by_genome[genome] = read_fasta(Path(row["fna"])) if row.get("fna") else {}
-        padloc_dest = out / "padloc" / genome
-        padloc_dest.mkdir(parents=True, exist_ok=True)
-        cached_padloc = padloc_csv(padloc_dest)
-        padloc_complete = padloc_run_complete(padloc_dest, out / "logs" / f"padloc.{genome}.log")
-        if padloc_complete:
-            print(f"Reusing PADLOC results for {genome}.")
-        elif args.representation_only:
-            fail(f"representation-only mode: cached PADLOC results missing for {genome} in {padloc_dest}")
-        elif args.skip_padloc:
-            fail(f"--skip-padloc was set but cached PADLOC results are missing for {genome} in {padloc_dest}")
-        else:
-            if not args.dry_run:
-                require_tool(args.env_runner, args.padloc_env, args.padloc, "PADLOC")
-            run(env_command(args.env_runner, args.padloc_env, args.padloc,
-                            ["--outdir", str(padloc_dest), "--cpu", str(args.threads),
-                             "--faa", row["faa"], "--gff", row["gff"]]),
-                out / "logs" / f"padloc.{genome}.log", args.dry_run)
-            if not args.dry_run:
-                (padloc_dest / ".hotspot_pipeline.complete").write_text("complete\n")
+        if not args.precomputed_systems:
+            padloc_dest = out / "padloc" / genome
+            padloc_dest.mkdir(parents=True, exist_ok=True)
+            cached_padloc = padloc_csv(padloc_dest)
+            padloc_complete = padloc_run_complete(padloc_dest, out / "logs" / f"padloc.{genome}.log")
+            if padloc_complete:
+                print(f"Reusing PADLOC results for {genome}.")
+            elif args.representation_only:
+                fail(f"representation-only mode: cached PADLOC results missing for {genome} in {padloc_dest}")
+            elif args.skip_padloc:
+                fail(f"--skip-padloc was set but cached PADLOC results are missing for {genome} in {padloc_dest}")
+            else:
+                if not args.dry_run:
+                    require_tool(args.env_runner, args.padloc_env, args.padloc, "PADLOC")
+                run(env_command(args.env_runner, args.padloc_env, args.padloc,
+                                ["--outdir", str(padloc_dest), "--cpu", str(args.threads),
+                                 "--faa", row["faa"], "--gff", row["gff"]]),
+                    out / "logs" / f"padloc.{genome}.log", args.dry_run)
+                if not args.dry_run:
+                    (padloc_dest / ".hotspot_pipeline.complete").write_text("complete\n")
 
-        df_dest = out / "defensefinder" / genome
-        df_dest.mkdir(parents=True, exist_ok=True)
-        df_faa = df_dest / f"{genome}.gembase.faa"
-        df_mapping = make_defensefinder_faa(genes, df_faa)
-        tsv(df_dest / "id_map.tsv", ["defensefinder_id", "original_gene_id", "contig", "start", "end"],
-            ((df_id, gene.gene_id, gene.contig, gene.start, gene.end) for df_id, gene in df_mapping.items()))
-        cached_defensefinder = defensefinder_systems(df_dest)
-        defensefinder_complete = (cached_defensefinder is not None
-                                  or (df_dest / ".hotspot_pipeline.complete").is_file())
-        if defensefinder_complete:
-            print(f"Reusing DefenseFinder results for {genome}.")
-        elif args.representation_only:
-            fail(f"representation-only mode: cached DefenseFinder results missing for {genome} in {df_dest}")
-        elif args.skip_defensefinder:
-            fail(f"--skip-defensefinder was set but cached results are missing for {genome} in {df_dest}")
-        else:
-            if not args.dry_run:
-                require_tool(args.env_runner, args.defense_finder_env, args.defense_finder, "DefenseFinder")
-            run(env_command(args.env_runner, args.defense_finder_env, args.defense_finder,
-                            ["run", "--out-dir", str(df_dest), "--workers", str(args.threads),
-                             "--db-type", "gembase", str(df_faa)]),
-                out / "logs" / f"defensefinder.{genome}.log", args.dry_run)
-            if not args.dry_run:
-                (df_dest / ".hotspot_pipeline.complete").write_text("complete\n")
+            df_dest = out / "defensefinder" / genome
+            df_dest.mkdir(parents=True, exist_ok=True)
+            df_faa = df_dest / f"{genome}.gembase.faa"
+            df_mapping = make_defensefinder_faa(genes, df_faa)
+            tsv(df_dest / "id_map.tsv", ["defensefinder_id", "original_gene_id", "contig", "start", "end"],
+                ((df_id, gene.gene_id, gene.contig, gene.start, gene.end) for df_id, gene in df_mapping.items()))
+            cached_defensefinder = defensefinder_systems(df_dest)
+            defensefinder_complete = (cached_defensefinder is not None
+                                      or (df_dest / ".hotspot_pipeline.complete").is_file())
+            if defensefinder_complete:
+                print(f"Reusing DefenseFinder results for {genome}.")
+            elif args.representation_only:
+                fail(f"representation-only mode: cached DefenseFinder results missing for {genome} in {df_dest}")
+            elif args.skip_defensefinder:
+                fail(f"--skip-defensefinder was set but cached results are missing for {genome} in {df_dest}")
+            else:
+                if not args.dry_run:
+                    require_tool(args.env_runner, args.defense_finder_env, args.defense_finder, "DefenseFinder")
+                run(env_command(args.env_runner, args.defense_finder_env, args.defense_finder,
+                                ["run", "--out-dir", str(df_dest), "--workers", str(args.threads),
+                                 "--db-type", "gembase", str(df_faa)]),
+                    out / "logs" / f"defensefinder.{genome}.log", args.dry_run)
+                if not args.dry_run:
+                    (df_dest / ".hotspot_pipeline.complete").write_text("complete\n")
 
-        if not args.dry_run:
-            result_csv = padloc_csv(padloc_dest)
-            if result_csv:
-                calls += parse_padloc(result_csv, genome, "padloc")
-            result_tsv = defensefinder_systems(df_dest)
-            if result_tsv:
-                calls += parse_defensefinder(result_tsv, genome, df_mapping)
+            if not args.dry_run:
+                result_csv = padloc_csv(padloc_dest)
+                if result_csv:
+                    calls += parse_padloc(result_csv, genome, "padloc")
+                result_tsv = defensefinder_systems(df_dest)
+                if result_tsv:
+                    calls += parse_defensefinder(result_tsv, genome, df_mapping)
     if args.dry_run:
         print(f"Dry run complete; commands are in {out / 'logs'}")
         return
 
-    systems = dereplicate(calls, args.min_call_overlap)
+    if args.precomputed_systems:
+        calls = load_precomputed_systems(args.precomputed_systems.resolve(), set(genes_by_genome))
+    raw_call_count = len(calls)
+    raw_padloc_call_count = sum("padloc" in c.routes or c.route == "padloc" for c in calls)
+    raw_defensefinder_call_count = sum("defensefinder" in c.routes or c.route == "defensefinder" for c in calls)
+    excluded_systems = {normal_name(x) for x in args.exclude_system}
+    excluded_calls = [c for c in calls if normal_name(c.system) in excluded_systems]
+    calls = [c for c in calls if normal_name(c.system) not in excluded_systems]
+    if excluded_calls:
+        print(f"Excluded {len(excluded_calls)} call(s) from hotspot inference: "
+              + ", ".join(sorted({c.system for c in excluded_calls})))
+    systems = calls if args.precomputed_systems else dereplicate(calls, args.min_call_overlap)
     tsv(out / "systems.dereplicated.tsv",
         ["locus_id", "genome", "contig", "start", "end", "system", "callers", "source_ids"],
         ((f"locus_{i:06d}", s.genome, s.contig, s.start, s.end, s.system, ",".join(sorted(s.routes)), s.source_id)
@@ -606,15 +756,26 @@ def main() -> None:
     if not systems:
         fail("PADLOC and DefenseFinder produced no defence-system calls")
 
+    systems_by_location = defaultdict(list)
+    for system in systems:
+        systems_by_location[(system.genome, system.contig)].append(system)
+
+    def overlaps_any_defence(gene: Gene) -> bool:
+        """True when a gene overlaps any retained defence call at its location."""
+        return any(system.end >= gene.start and system.start <= gene.end
+                   for system in systems_by_location[(gene.genome, gene.contig)])
+
     window = round(args.window_kb * 1000)
     locus_genes: dict[str, list[Gene]] = {}
     system_for_locus: dict[str, SystemCall] = {}
+    systems_for_locus: dict[str, list[SystemCall]] = {}
     for i, system in enumerate(systems, 1):
         lid = f"locus_{i:06d}"
-        selected = [replace(g, defence=(g.end >= system.start and g.start <= system.end))
+        selected = [replace(g, defence=overlaps_any_defence(g))
                     for g in genes_by_genome[system.genome] if g.contig == system.contig
                     and g.end >= system.start - window and g.start <= system.end + window]
         locus_genes[lid], system_for_locus[lid] = selected, system
+        systems_for_locus[lid] = [system]
         write_fasta(((g.uid, g.sequence) for g in selected if g.sequence), out / "neighbourhoods" / f"{lid}.faa")
         tsv(out / "neighbourhoods" / f"{lid}.genes.tsv",
             ["gene_id", "genome", "contig", "start", "end", "strand", "product", "is_defence"],
@@ -626,7 +787,14 @@ def main() -> None:
     all_genome_faa = out / "neighbourhoods" / "all_genome_proteins.faa"
     write_fasta(unique_records.items(), all_genome_faa)
     cluster_tsv = out / "mmseqs" / "all_proteins_cluster.tsv"
-    if cluster_tsv.is_file():
+    if args.precomputed_clusters:
+        source_clusters = args.precomputed_clusters.resolve()
+        if not source_clusters.is_file():
+            fail(f"precomputed cluster table not found: {source_clusters}")
+        if source_clusters != cluster_tsv.resolve():
+            shutil.copyfile(source_clusters, cluster_tsv)
+        print(f"Reusing precomputed protein clusters from {source_clusters}.")
+    elif cluster_tsv.is_file():
         print(f"Reusing MMseqs2 clusters from {cluster_tsv}.")
     elif args.representation_only:
         fail(f"representation-only mode: cached MMseqs2 clusters missing: {cluster_tsv}")
@@ -689,6 +857,8 @@ def main() -> None:
     hotspot_rows, architecture_count = [], Counter()
     signature_pairs = {}
     selected_loci = []
+    excluded_boundary_pairs = load_excluded_boundary_pairs(
+        args.exclude_boundary_pairs.resolve() if args.exclude_boundary_pairs else None)
     for lid, genes in locus_genes.items():
         s = system_for_locus[lid]
         group = normal_name(s.system)
@@ -697,6 +867,8 @@ def main() -> None:
         if not lefts or not rights:
             continue
         left, right = max(lefts, key=lambda g: g.end), min(rights, key=lambda g: g.start)
+        if (left.cluster, right.cluster) in excluded_boundary_pairs:
+            continue
         n = group_size[group]
         lf, rf = left_count[(group, left.cluster)] / n, right_count[(group, right.cluster)] / n
         pair_balance = min(lf, rf) / max(lf, rf)
@@ -707,18 +879,25 @@ def main() -> None:
         architecture_count[signature] += 1
         selected_loci.append((lid, left, right, signature))
 
+    # Multiple defence calls in the same interval can nominate the identical
+    # boundary pair. Count that genomic interval once, not once per caller/system.
+    unique_selected = {}
+    for instance in selected_loci:
+        lid, left, right, signature = instance
+        anchor = system_for_locus[lid]
+        key = (anchor.genome, anchor.contig, left.gene_id, right.gene_id, signature)
+        unique_selected.setdefault(key, instance)
+    selected_loci = list(unique_selected.values())
+
     # Search all genomes for the accepted boundary-cluster pairs, including
     # loci where neither caller detected any defence system between them.
-    systems_by_location = defaultdict(list)
-    for system in systems:
-        systems_by_location[(system.genome, system.contig)].append(system)
     existing_pairs = {(system_for_locus[lid].genome, system_for_locus[lid].contig,
                        left.gene_id, right.gene_id, signature)
                       for lid, left, right, signature in selected_loci}
     max_span_by_signature = defaultdict(int)
     for _, left, right, signature in selected_loci:
         max_span_by_signature[signature] = max(max_span_by_signature[signature], right.end-left.start+1)
-    boundary_only_number = 0
+    boundary_scan_number = 0
     for signature, (left_cluster, right_cluster) in signature_pairs.items():
         scan_span = round(max_span_by_signature[signature] * args.boundary_scan_span_factor)
         for genome, genome_genes in genes_by_genome.items():
@@ -729,9 +908,10 @@ def main() -> None:
                 ordered = sorted(contig_genes, key=lambda g: (g.start, g.end))
                 rights = [g for g in ordered if g.cluster == right_cluster]
                 used_right = set()
-                for left in (g for g in ordered if g.cluster == left_cluster):
+                for left in (g for g in ordered if g.cluster == left_cluster
+                             and not overlaps_any_defence(g)):
                     possible = [g for g in rights if g.gene_id not in used_right and g.start > left.end
-                                and g.end-left.start+1 <= scan_span]
+                                and g.end-left.start+1 <= scan_span and not overlaps_any_defence(g)]
                     if not possible:
                         continue
                     right = min(possible, key=lambda g: g.start)
@@ -741,19 +921,23 @@ def main() -> None:
                         continue
                     internal_systems = [s for s in systems_by_location[(genome, contig)]
                                         if s.end >= left.start and s.start <= right.end]
-                    if internal_systems:
-                        continue
-                    boundary_only_number += 1
-                    lid = f"boundary_only_{boundary_only_number:06d}"
-                    between = [replace(g, defence=False) for g in ordered
+                    boundary_scan_number += 1
+                    prefix = "boundary_defence" if internal_systems else "boundary_only"
+                    lid = f"{prefix}_{boundary_scan_number:06d}"
+                    internal_gene_ids = {
+                        g.gene_id for internal in internal_systems
+                        for g in genes_called_by_system(ordered, internal)
+                    }
+                    between = [replace(g, defence=g.gene_id in internal_gene_ids)
+                               for g in ordered
                                if g.start >= left.start and g.end <= right.end]
                     # Use the copied boundary objects so identity-based colouring works.
                     copied_left = next(g for g in between if g.gene_id == left.gene_id)
                     copied_right = next(g for g in between if g.gene_id == right.gene_id)
                     locus_genes[lid] = between
-                    system_for_locus[lid] = SystemCall(genome, "boundary_scan", lid, contig,
-                                                       copied_left.end+1, copied_right.start-1,
-                                                       "no defence detected", set(), {"boundary_scan"})
+                    systems_for_locus[lid] = internal_systems
+                    system_for_locus[lid] = combined_system_call(
+                        genome, contig, lid, internal_systems, copied_left, copied_right)
                     selected_loci.append((lid, copied_left, copied_right, signature))
                     existing_pairs.add(key)
                     used_right.add(right.gene_id)
@@ -761,12 +945,44 @@ def main() -> None:
     total_architecture_count = Counter(instance[3] for instance in selected_loci)
     eligible_signatures = [sig for sig in sorted(total_architecture_count)
                            if total_architecture_count[sig] >= args.min_hotspot_members]
-    signature_ids = {sig: f"hotspot_{i:04d}" for i, sig in enumerate(eligible_signatures, 1)}
+    signature_ids = {sig: f"{args.hotspot_prefix}_{i:04d}" for i, sig in enumerate(eligible_signatures, 1)}
+    selected_loci = [instance for instance in selected_loci if instance[3] in signature_ids]
+    # Re-annotate every retained locus using all calls inside its final boundaries.
+    # This captures alternate and multiple systems, including calls recovered by
+    # the boundary scan, rather than displaying only the system that seeded it.
+    updated_loci = []
+    for lid, left, right, signature in selected_loci:
+        anchor = system_for_locus[lid]
+        internal_systems = [s for s in systems_by_location[(anchor.genome, anchor.contig)]
+                            if s.end >= left.start and s.start <= right.end]
+        systems_for_locus[lid] = internal_systems
+        genes = locus_genes[lid]
+        called_gene_ids = {
+            g.gene_id for internal in internal_systems for g in genes_called_by_system(genes, internal)
+        }
+        genes = [replace(g, defence=g.gene_id in called_gene_ids) for g in genes]
+        locus_genes[lid] = genes
+        copied_left = next(g for g in genes if g.gene_id == left.gene_id)
+        copied_right = next(g for g in genes if g.gene_id == right.gene_id)
+        # Boundaries flank defence content; they cannot themselves be part of a
+        # retained PADLOC/DefenseFinder call in that instance.
+        if copied_left.defence or copied_right.defence:
+            continue
+        system_for_locus[lid] = combined_system_call(
+            anchor.genome, anchor.contig, lid, internal_systems, copied_left, copied_right)
+        updated_loci.append((lid, copied_left, copied_right, signature))
+    selected_loci = updated_loci
+    # Recheck prevalence after strict boundary validation and assign stable IDs
+    # only to architectures that still meet the requested member threshold.
+    total_architecture_count = Counter(instance[3] for instance in selected_loci)
+    eligible_signatures = [sig for sig in sorted(total_architecture_count)
+                           if total_architecture_count[sig] >= args.min_hotspot_members]
+    signature_ids = {sig: f"{args.hotspot_prefix}_{i:04d}" for i, sig in enumerate(eligible_signatures, 1)}
     selected_loci = [instance for instance in selected_loci if instance[3] in signature_ids]
     # These directories are fully generated artifacts. Rebuild them exactly so
     # representations from no-longer-eligible singleton architectures cannot linger.
     loci_root = out / "loci"
-    for old_dir in loci_root.glob("hotspot_[0-9][0-9][0-9][0-9]"):
+    for old_dir in loci_root.glob(f"{args.hotspot_prefix}_[0-9][0-9][0-9][0-9]"):
         if old_dir.is_dir():
             shutil.rmtree(old_dir)
     for lid, left, right, signature in selected_loci:
@@ -794,7 +1010,7 @@ def main() -> None:
     for hotspot, instances in sorted(instances_by_hotspot.items()):
         group_dir = out / "loci" / hotspot
         pdf_hotspot_group(group_dir / f"{hotspot}.comparative.pdf", hotspot, instances,
-                          locus_genes, system_for_locus)
+                          locus_genes, system_for_locus, systems_for_locus, args.plot_palette)
         combined_genes = []
         combined_faa = []
         combined_rows = []
@@ -813,21 +1029,24 @@ def main() -> None:
             handle.write("##gff-version 3\n")
             for lid, g in combined_genes:
                 product = g.product.replace(";", ",")
-                handle.write(f"{lid}|{g.genome}|{g.contig}\thotspot_pipeline\tCDS\t{g.start}\t{g.end}\t.\t{g.strand}\t.\t"
+                handle.write(f"{lid}|{g.genome}|{g.contig}\tPhorificV2\tCDS\t{g.start}\t{g.end}\t.\t{g.strand}\t.\t"
                              f"ID={lid}|{g.gene_id};product={product};cluster={g.cluster};"
                              f"defence={str(g.defence).lower()}\n")
     tsv(out / "hotspots.tsv",
         ["hotspot_id", "locus_id", "genome", "contig", "start", "end", "left_boundary_id", "right_boundary_id",
          "left_boundary_cluster", "right_boundary_cluster", "defence_system", "defence_present",
          "instances_of_architecture"], hotspot_rows)
-    summary = {"genomes": len(rows), "raw_caller_calls": len(calls),
-               "padloc_calls": sum("padloc" in x.routes for x in calls),
-               "defensefinder_calls": sum("defensefinder" in x.routes for x in calls),
+    summary = {"genomes": len(rows), "raw_caller_calls": raw_call_count,
+               "padloc_calls": raw_padloc_call_count,
+               "defensefinder_calls": raw_defensefinder_call_count,
                "dereplicated_systems": len(systems),
                "protein_clusters": len(set(member_to_cluster.values())),
                "qualifying_left_clusters": len(qualifying_left), "qualifying_right_clusters": len(qualifying_right),
                "hotspot_architectures": len(signature_ids), "hotspot_instances": len(hotspot_rows),
                "boundary_only_instances": sum(row[-2] == 0 for row in hotspot_rows),
+               "boundary_recovered_defence_instances": sum(row[1].startswith("boundary_defence_") for row in hotspot_rows),
+               "excluded_system_calls": len(excluded_calls),
+               "excluded_existing_boundary_pairs": len(excluded_boundary_pairs),
                "parameters": vars(args) | {"manifest": str(args.manifest) if args.manifest else None,
                                               "input_dir": str(args.input_dir) if args.input_dir else None,
                                               "outdir": str(out)}}
